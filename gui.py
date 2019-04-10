@@ -9,12 +9,22 @@ from picamera.array import PiRGBArray
 from time import sleep
 from threading import Thread
 import sys
+import os
+import glob
+import Adafruit_ADS1x15
+import Adafruit_BBIO.GPIO as GPIO
 
 
 image = np.zeros((320, 240, 3), np.uint8)
 settingSpecs = {}
 resolution = [320, 240]
 end_thread = False
+gazValue = 0
+tempVallue = 0
+camera_warning = False
+temp_warning = False
+gaz_warning = False
+
 
 def configButtonCllbck():
     global settingSpecs
@@ -93,6 +103,49 @@ resolutionButton.grid(row=0, column=1)
 resolutionButton = Button(buttonFrame, text='Close', command=closeButtonCllbck)
 resolutionButton.grid(row=0, column=2)
 
+'''
+sensor
+'''
+GPIO.setup("GPIO0_26", GPIO.OUT)
+
+adc = Adafruit_ADS1x15.ADS1115()
+GAIN = 2/3
+
+os.system('modprobe w1-gpio')
+os.system('modprobe w1-therm')
+ 
+base_dir = '/sys/bus/w1/devices/'
+try:
+    device_folder = glob.glob(base_dir + '28*')[0]
+    device_file = device_folder + '/w1_slave'
+except Exception as e:
+    print(e)
+
+
+def read_temp_raw():
+    f = open(device_file, 'r')
+    lines = f.readlines()
+    f.close()
+    return lines
+ 
+ 
+def read_temp():
+    lines = read_temp_raw()
+    while lines[0].strip()[-3:] != 'YES':
+        sleep(0.2)
+        lines = read_temp_raw()
+    # tim vi tri 't=' trong line 1
+    equals_pos = lines[1].find('t=')
+    
+    # neu co 't=' trong line 1
+    if equals_pos != -1:
+        # lay cac ky tu tu sau dau '=' den het chuoi lines[1]
+        temp_string = lines[1][equals_pos+2:]
+        # chuyen 'temp_string' tu dang string sang dang so thuc
+        temp_c = float(temp_string) / 1000.0
+        # tra gia tri ve cho ham 'read_temp'
+        return temp_c
+
 
 def on_trackbar(val):
     pass
@@ -109,7 +162,10 @@ if len(sys.argv)>1 and sys.argv[1]== 'calib':
     cv2.createTrackbar("Vmax", title_window, 0, 255, on_trackbar)
     cv2.createTrackbar("Vmin", title_window, 0, 255, on_trackbar)
 
-def showInfo(gazValue, tempVallue):
+
+def showInfo():
+    global temp_warning, gaz_warning
+    
     try:
         # default ref temperature vallue
         temp = tempText.format(settingSpecs['tempRef'], tempVallue)
@@ -117,30 +173,54 @@ def showInfo(gazValue, tempVallue):
         tempInfo.insert(1.0, temp)
         tempInfo.grid(row=0, column=0)
         tempInfo.tag_add("temptag", "1.0", END)
-        if tempVallue >= settingSpecs['tempRef']:
+        if tempVallue >= settingSpecs['tempRef'] or tempVallue == 0:
             tempInfo.tag_config("temptag", background="red", foreground="blue")
+            temp_warning = True
         else:
             tempInfo.tag_config("temptag", background="white", foreground="black")
+            temp_warning = False
     except Exception as e:
         print(e)
 
     try:
         # default ref gaz vallue
         gaz = gazText.format(settingSpecs['gazRef'], gazValue)
+        # xoa tat ca cac ky tu tu toa do (1, 0) den het
         gazInfo.delete(1.0, END)
+        # chen thong tin moi 
         gazInfo.insert(1.0, gaz)
+        # chen thong tin cam bien gaz vao hang 0 cot 0
         gazInfo.grid(row=0, column=0)
+        # dua toan bo thong tin cam bien gaz vao tag 'temptag'
         gazInfo.tag_add("temptag", "1.0", END)
-        if gazValue >= settingSpecs['gazRef']:
+        # neu gia tri do tu cam bien lon hon gia tri cho phep thi canh bao bang cach to nen mau do
+        if gazValue >= settingSpecs['gazRef'] or gazValue == 0:
             gazInfo.tag_config("temptag", background="red", foreground="blue")
+            gaz_warning = True
         else:
             gazInfo.tag_config("temptag", background="white", foreground="black")
+            gaz_warning = False
+
     except Exception as e:
         print(e)
 
 
 def readSensor():
-    return datetime.now().second, datetime.now().second
+    temp = 0
+    adc_val = 0
+    try:
+        temp = read_temp()
+    except Exception as e:
+        print(e)
+        pass
+    
+    try:
+        adc_val = adc.read_adc(3, gain=GAIN)
+    except Exception as e:
+        print(e)
+        pass
+
+    return adc_val, temp
     
 
 def find_biggest_fire(src): # src la anh
@@ -158,10 +238,16 @@ def find_biggest_fire(src): # src la anh
     else:
         return src, [0,0,0,0]
     
-    
-    
+
+def thread_sensor(threadname):
+    while True:
+        global gazValue, tempVallue
+        gazValue, tempVallue = readSensor()
+        if end_thread == True:
+            break
+
 def thread_camera(threadname):
-    global image
+    global image, camera_warning
     cap = PiCamera()
     cap.resolution = (320, 240)
     cap.framerate = 15
@@ -221,10 +307,12 @@ def thread_camera(threadname):
 
         if loop > 30:
             loop = 0
-            if sum_diff > 100:
-                print("fire")
+            if sum_diff > settingSpecs['ref_sum_diff']:
+                print("warning: camera detects fire")
+                camera_warning = True
             else:
-                print("clear")
+                camera_warning = False
+                
             print("fluctuation:", sum_diff)
             sum_diff = 0
         # cv2.imshow("cen", detected_edges)
@@ -247,12 +335,18 @@ def thread_camera(threadname):
             break
 
 
+def alarm():
+    if gaz_warning and temp_warning and camera_warning:
+        GPIO.output("GPIO0_26", GPIO.LOW)
+    else:
+        GPIO.output("GPIO0_26", GPIO.HIGH)
     
+
 # function for video streaming
 def video_stream():
-    gazValue, tempVallue = readSensor()
-    showInfo(gazValue, tempVallue)
     
+    showInfo()
+    alarm()
     cv2image = cv2.cvtColor(image, cv2.COLOR_BGR2RGBA)
     newimage = cv2.resize(cv2image, (resolution[0], resolution[1]))
     img = Image.fromarray(newimage)
@@ -264,6 +358,9 @@ def video_stream():
 
 thread1 = Thread(target=thread_camera, args=('Thread-1', ))
 thread1.start()
+
+thread2 = Thread(target=thread_sensor, args=('Thread-2', ))
+thread2.start()
 
 video_stream()
 root.mainloop()
